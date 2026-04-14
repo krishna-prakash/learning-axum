@@ -1,6 +1,8 @@
 
-use axum::{Json, Router, extract::{FromRequest, Path, Query, Request}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{get, post}};
-use serde::Deserialize;
+use std::sync::Arc;
+
+use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{get, post}};
+use serde::{Deserialize, Serialize};
 
 
 async fn hello_world() -> (StatusCode, &'static str) {
@@ -114,7 +116,7 @@ where
             if user.name.len() < 3 {
                 return Err(ValidationError::NameTooShort);
             }
-            
+
             Ok(ValidateJson(user))   
         }
      }
@@ -124,18 +126,55 @@ async fn create_validated_user(ValidateJson(user): ValidateJson<ValidateUser>) -
     format!("Validated user created: Name: {}, Email: {}", user.name, user.email)
 }
 
+#[derive(Debug, Serialize)]
+struct CreateUserResponse {
+    id: u64,
+    name: String,
+    email: String,
+}
 
+async fn create_user(ValidateJson(payload): ValidateJson<ValidateUser>) -> Json<CreateUserResponse> {
+    let response = CreateUserResponse {
+        id: 1,
+        name: payload.name,
+        email: payload.email,
+    };
+    Json(response)
+}
+
+#[derive(Clone)]
+struct AppState {
+    db_pool: String, // Placeholder for a database connection pool
+    api_version: String,
+}
+
+async fn with_state(State(state): State<Arc<AppState>>) -> String {
+    format!("API Version: {}, DB Pool: {}", state.api_version, state.db_pool)
+}
 
 #[tokio::main]
 async fn main() {
+
+    let state = Arc::new(AppState {
+        db_pool: "Database Connection Pool".to_string(),
+        api_version: "v1".to_string(),
+    });
+
+    // let state_router = Router::new()
+    //     .route("/state", get(with_state))
+    //     .with_state(state.clone());
+
     let app = Router::new()
         .route("/", get(hello_world))
         .route("/health", get(health_check))
         .route("/resource/{id}", get(get_resource_by_id))
-        .nest("/api/v1", api_v1())
+        // .nest("/api/v1", api_v1())
         .route("/multiple_headers/{id}", post(multiple_headers))
         .route("/validated_user", post(create_validated_user))
-        .fallback(not_found);
+        .route("/users", post(create_user))
+        .route("/state", get(with_state))
+        .fallback(not_found)
+        .with_state(state);
 
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");
