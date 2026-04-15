@@ -1,8 +1,9 @@
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::{Arc, RwLock}};
 
 use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 
 async fn hello_world() -> (StatusCode, &'static str) {
@@ -152,6 +153,59 @@ async fn with_state(State(state): State<Arc<AppState>>) -> String {
     format!("API Version: {}, DB Pool: {}", state.api_version, state.db_pool)
 }
 
+#[derive(Clone, Serialize)]
+struct Config {
+    app_name: String,
+    app_version: String,
+}
+
+async fn get_config(State(config): State<Arc<Config>>) -> Json<Config> {
+    Json(config.as_ref().clone())
+}
+
+// Todo implementation with in memeory db with hashmaps
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Todo {
+    id: String,
+    title: String,
+    completed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTodo {
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTodo {
+    title: Option<String>,
+    completed: Option<bool>,
+}
+
+type TodoStore = Arc<RwLock<HashMap<String, Todo>>>;
+
+async fn create_todo(
+    State(store): State<TodoStore>,
+    Json(todo): Json<CreateTodo>
+) {
+   let todo = Todo {
+        id: Uuid::new_v4().to_string(), // Generate a unique ID for the todo
+        title: todo.title,
+        completed: false,
+   };
+    store.write().unwrap().insert(todo.id.to_string(), todo);
+}
+
+async fn list_todos(
+    State(store): State<TodoStore>
+) -> Json<Vec<Todo>> {
+    let todos = store.read().unwrap();
+    let todo_list: Vec<Todo> = todos.values().cloned().collect();
+    Json(todo_list)
+}
+
+
 #[tokio::main]
 async fn main() {
 
@@ -160,9 +214,13 @@ async fn main() {
         api_version: "v1".to_string(),
     });
 
-    // let state_router = Router::new()
-    //     .route("/state", get(with_state))
-    //     .with_state(state.clone());
+    let config = Arc::new(Config {
+        app_name: "My Axum App".to_string(),
+        app_version: "1.0.0".to_string(),
+    });
+
+    // initialize the in-memory todo store
+    let todo_store: TodoStore = Arc::new(RwLock::new(HashMap::new()));
 
     let app = Router::new()
         .route("/", get(hello_world))
@@ -174,7 +232,11 @@ async fn main() {
         .route("/users", post(create_user))
         .route("/state", get(with_state))
         .fallback(not_found)
-        .with_state(state);
+        .with_state(state)
+        .route("/config", get(get_config))
+        .with_state(config)
+        .route("/todos", post(create_todo).get(list_todos))
+        .with_state(todo_store);
 
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");

@@ -7,3 +7,4 @@ edition = "2024"
 axum = "0.8.8"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.51.1", features = ["full"] }
+uuid = { version = "1.23.0", features = ["v4", "serde"] }
