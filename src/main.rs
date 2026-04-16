@@ -177,12 +177,6 @@ struct CreateTodo {
     title: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct UpdateTodo {
-    title: Option<String>,
-    completed: Option<bool>,
-}
-
 type TodoStore = Arc<RwLock<HashMap<String, Todo>>>;
 
 async fn create_todo(
@@ -205,6 +199,33 @@ async fn list_todos(
     Json(todo_list)
 }
 
+// DB connection example
+#[allow(dead_code)]
+struct DbPool {
+    connection_string: String,
+    max_connections: u32,
+}
+
+impl DbPool {
+    fn new(connection_string: &str) -> Self {
+        Self {
+            connection_string: connection_string.to_string(),
+            max_connections: 10,
+        }
+    }
+
+    async fn query(&self, _sql: &str) -> Result<Vec<String>, String> {
+        // Simulate a database query
+        Ok(vec!["Result 1".to_string(), "Result 2".to_string()])
+    }
+}
+
+async fn db_query(State(pool): State<Arc<DbPool>>) -> Json<Vec<String>> {
+    match pool.query("SELECT * FROM my_table").await {
+        Ok(results) => Json(results),
+        Err(e) => Json(vec![format!("Error: {}", e)]),
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -222,6 +243,9 @@ async fn main() {
     // initialize the in-memory todo store
     let todo_store: TodoStore = Arc::new(RwLock::new(HashMap::new()));
 
+    // dummy db connection pool
+    let db_pool = Arc::new(DbPool::new("postgres://user:password@localhost/db"));
+
     let app = Router::new()
         .route("/", get(hello_world))
         .route("/health", get(health_check))
@@ -236,8 +260,9 @@ async fn main() {
         .route("/config", get(get_config))
         .with_state(config)
         .route("/todos", post(create_todo).get(list_todos))
-        .with_state(todo_store);
-
+        .with_state(todo_store)
+        .route("/db_query", get(db_query))
+        .with_state(db_pool);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");
     
