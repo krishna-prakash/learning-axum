@@ -1,8 +1,10 @@
 
-use std::{collections::HashMap, sync::{Arc, RwLock}};
+use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
 
-use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{get, post}};
+use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde::{Deserialize, Serialize};
+use tower::ServiceBuilder;
+use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 
@@ -227,9 +229,28 @@ async fn db_query(State(pool): State<Arc<DbPool>>) -> Json<Vec<String>> {
     }
 }
 
+// Tracing middleware example
+
+async fn with_tracing(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let start = Instant::now();
+
+    let response = next.run(request).await;
+
+    tracing::info!(
+        method = %method,
+        uri = %uri,
+        status = %response.status().as_u16(),
+        duration_ms = %start.elapsed().as_millis(),
+        "Request completed"
+    );
+    response
+}
+
 #[tokio::main]
 async fn main() {
-
+    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
     let state = Arc::new(AppState {
         db_pool: "Database Connection Pool".to_string(),
         api_version: "v1".to_string(),
@@ -262,7 +283,11 @@ async fn main() {
         .route("/todos", post(create_todo).get(list_todos))
         .with_state(todo_store)
         .route("/db_query", get(db_query))
-        .with_state(db_pool);
+        .with_state(db_pool)
+        .layer(middleware::from_fn(with_tracing))
+        .layer(
+            ServiceBuilder::new().layer(TraceLayer::new_for_http())
+        );
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");
     
