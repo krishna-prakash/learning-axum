@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
 
 use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -248,9 +249,71 @@ async fn with_tracing(request: Request, next: Next) -> Response {
     response
 }
 
+// Error handling
+#[derive(Error, Debug)]
+enum AppError {
+    #[error("User not found with ID: {0}")]
+    UserNotFound(u64),
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+    #[error("Database error: {0}")]
+    DatabaseError(String),
+    #[error("Unauthorized access")]
+    Unauthorized,
+    #[error("Internal server error")]
+    InternalError,
+}
+
+#[derive(Serialize, Debug)]
+struct ErrorResponse {
+    message: String,
+    code: u16,
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, message) = match &self {
+            AppError::UserNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            AppError::InvalidInput(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AppError::DatabaseError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AppError::InternalError => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+        };
+
+        let error_response = ErrorResponse {
+            message,
+            code: status.as_u16(),
+        };
+        (status, Json(error_response)).into_response()
+    }
+}
+
+#[derive(Serialize)]
+struct User {
+    id: u64,
+    name: String,
+}
+
+async fn get_user(Path(id): Path<u64>) -> Result<Json<User>, AppError> {
+   match id {
+    1 => Ok(Json(User {
+        id,
+        name: "Krishna".to_string(),
+    })),
+    2 => Ok(Json(User {
+        id,
+        name: "Arjuna".to_string(),
+    })),
+    _ => Err(AppError::UserNotFound(id)),
+   } 
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    let user_not_found = AppError::UserNotFound(53);
+    println!("Error: {}", user_not_found);
+
     let state = Arc::new(AppState {
         db_pool: "Database Connection Pool".to_string(),
         api_version: "v1".to_string(),
@@ -284,6 +347,7 @@ async fn main() {
         .with_state(todo_store)
         .route("/db_query", get(db_query))
         .with_state(db_pool)
+        .route("/users/{id}", get(get_user))
         .layer(middleware::from_fn(with_tracing))
         .layer(
             ServiceBuilder::new().layer(TraceLayer::new_for_http())
