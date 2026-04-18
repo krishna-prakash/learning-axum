@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
 
 use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, postgres::PgPoolOptions, types::chrono};
 use thiserror::Error;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -288,31 +289,72 @@ impl IntoResponse for AppError {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, sqlx::FromRow, sqlx::Decode, Debug)]
 struct User {
-    id: u64,
+    id: Uuid,
     name: String,
+    email: String,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
-async fn get_user(Path(id): Path<u64>) -> Result<Json<User>, AppError> {
-   match id {
-    1 => Ok(Json(User {
-        id,
-        name: "Krishna".to_string(),
-    })),
-    2 => Ok(Json(User {
-        id,
-        name: "Arjuna".to_string(),
-    })),
-    _ => Err(AppError::UserNotFound(id)),
-   } 
+async fn private_route() -> Result<&'static str, AppError> {
+    let unaithorized = true; // Simulate an unauthorized access
+    if unaithorized {
+        Err(AppError::Unauthorized)
+    } else {
+        Ok("Welcome to the private route!") 
+    }
+}
+
+// Databse error handling example
+#[derive(Error, Debug)]
+enum DbError {
+    #[error("User not found")]
+    NotFound,
+    #[error("Database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+impl IntoResponse for DbError {
+    fn into_response(self) -> Response {
+        let (status, message) = match &self {
+            DbError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
+            DbError::Sqlx(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+        };
+
+       
+        (status, message).into_response()
+    }
+}
+
+async fn get_users(State(pool): State<PgPool>) -> Result<Json<Vec<User>>, DbError> {
+    let results = sqlx::query_as::<_, User>("SELECT * FROM users ORDRER BY id CREATEWD_AT DESC")
+        .fetch_all(&pool)
+        .await?;
+
+    Ok(Json(results))
 }
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
-    let user_not_found = AppError::UserNotFound(53);
-    println!("Error: {}", user_not_found);
+
+    let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
+    println!("Database URL: {}", db_url);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("Failed to create database pool");
+
+    // Run Migrations
+    sqlx::query("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .expect("Failed to run migrations");
+
 
     let state = Arc::new(AppState {
         db_pool: "Database Connection Pool".to_string(),
@@ -338,16 +380,19 @@ async fn main() {
         .route("/multiple_headers/{id}", post(multiple_headers))
         .route("/validated_user", post(create_validated_user))
         .route("/users", post(create_user))
-        .route("/state", get(with_state))
+        // .route("/state", get(with_state))
         .fallback(not_found)
-        .with_state(state)
-        .route("/config", get(get_config))
-        .with_state(config)
-        .route("/todos", post(create_todo).get(list_todos))
-        .with_state(todo_store)
-        .route("/db_query", get(db_query))
-        .with_state(db_pool)
-        .route("/users/{id}", get(get_user))
+        // .with_state(state)
+        // .route("/config", get(get_config))
+        // .with_state(config)
+        // .route("/todos", post(create_todo).get(list_todos))
+        // .with_state(todo_store)
+        // .route("/db_query", get(db_query))
+        // .with_state(db_pool)
+        // .route("/users/{id}", get(get_user))
+        .route("/private", get(private_route))
+        .route("/get_users", get(get_users))
+        .with_state(pool)
         .layer(middleware::from_fn(with_tracing))
         .layer(
             ServiceBuilder::new().layer(TraceLayer::new_for_http())
@@ -355,5 +400,5 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");
     
-    axum::serve(listener, app).await.expect("Failed to start server");
+    axum::serve(listener, app).await.unwrap();
 }
