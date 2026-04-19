@@ -1,10 +1,10 @@
 
 use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
 
-use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions, query, types::chrono};
+use sqlx::{PgPool, Postgres, QueryBuilder, pool, postgres::PgPoolOptions, query, types::chrono};
 use thiserror::Error;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -411,6 +411,36 @@ fn hash_password(password: &str) -> String {
         .to_string()
 }
 
+fn verify_password(password: &str, hash: &str) -> bool {
+    let parsed_hash = argon2::PasswordHash::new(hash).expect("Invalid hash format");
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+async fn login(State(pool): State<PgPool>, Json(payload): Json<LoginRequest>) -> Result<String, AppError> {
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
+        .bind(&payload.email)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => AppError::Unauthorized,
+            _ => AppError::DatabaseError(e.to_string()),
+        })?;
+
+        if verify_password(&payload.password, &user.password_hash) {
+            Ok(format!("Welcome back, {}!", user.name))
+        } else {
+            Err(AppError::Unauthorized)
+        }
+}
+
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok();
@@ -459,6 +489,7 @@ async fn main() {
         // .nest("/api/v1", api_v1())
         .route("/multiple_headers/{id}", post(multiple_headers))
         .route("/validated_user", post(create_validated_user))
+        .route("/login", post(login))
         .merge(Router::new().nest("/users", user_routes))
         // .route("/state", get(with_state))
         .fallback(not_found)
