@@ -1,6 +1,7 @@
 
 use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
 
+use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions, query, types::chrono};
@@ -230,6 +231,7 @@ struct User {
     id: Uuid,
     name: String,
     email: String,
+    password_hash: String,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -247,6 +249,7 @@ struct ValidateJson<T>(T);
 struct ValidateUser {
     name: String,
     email: String,
+    password: String,
 }
 
 #[derive(Debug)]
@@ -336,10 +339,11 @@ async fn get_users(State(pool): State<PgPool>) -> Result<Json<Vec<User>>, DbErro
 }
 
 async fn create_user(State(pool): State<PgPool>, ValidateJson(payload): ValidateJson<ValidateUser>) -> Json<User> {
-     let user  = sqlx::query_as::<_, User>("INSERT INTO users (id, name, email, created_at) VALUES ($1, $2, $3, NOW()) RETURNING *")
+     let user  = sqlx::query_as::<_, User>("INSERT INTO users (id, name, email, password_hash, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING *")
         .bind(Uuid::new_v4()) // Generate a new UUID for the user
         .bind(&payload.name)
         .bind(&payload.email)
+        .bind(hash_password(&payload.password)) // Hash the password before storing
         .fetch_one(&pool)
         .await
         .expect("Failed to create user");
@@ -382,6 +386,31 @@ async fn udpate_user(State(pool): State<PgPool>, Path(id): Path<Uuid>, Json(payl
         Ok(Json(result?))   
 }    
 
+async fn delete_user(State(pool): State<PgPool>, Path(id): Path<Uuid>) -> Result<StatusCode, DbError> {
+    let result = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .map_err(|e| DbError::Sqlx(e))?;
+
+    if result.rows_affected() == 0 {
+        Err(DbError::NotFound)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
+}
+
+// Auth 
+// Password hashing example using argon2
+
+fn hash_password(password: &str) -> String {
+    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("Failed to hash password")
+        .to_string()
+}
+
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok();
@@ -398,10 +427,10 @@ async fn main() {
 
     let user_routes = Router::new()
         .route("/", post(create_user).get(get_users))
-        .route("/{id}", get(get_user_by_id).put(udpate_user));
+        .route("/{id}", get(get_user_by_id).put(udpate_user).delete(delete_user));
 
     // Run Migrations
-    sqlx::query("CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ DEFAULT NOW())")
+    sqlx::query("CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())")
         .execute(&pool)
         .await
         .expect("Failed to run migrations");
