@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
 
 use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, types::chrono};
+use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions, query, types::chrono};
 use thiserror::Error;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -69,63 +69,6 @@ async fn multiple_headers(
     )
 }
 
-#[derive(Debug, Deserialize)]
-// A wrapper type to validate JSON payloads
-struct ValidateJson<T>(T);
-
-#[derive(Debug, Deserialize)]
-struct ValidateUser {
-    name: String,
-    email: String,
-}
-
-#[derive(Debug)]
-enum ValidationError {
-    InvalaidJson(String),
-    InvalidEmail,
-    NameTooShort
-}
-
-impl IntoResponse for ValidationError {
-    fn into_response(self) -> Response {
-        let (status, message) = match self {
-            ValidationError::InvalaidJson(e) => (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)),
-            ValidationError::InvalidEmail => (StatusCode::BAD_REQUEST, "Invalid email format".to_string()),
-            ValidationError::NameTooShort => (StatusCode::BAD_REQUEST, "Name must be at least 3 characters long".to_string()),
-        };
-        (status, message).into_response()
-    }
-}
-
-// Use axum FromRequest to implement validation logic for the defined wrapper type ValidateJson<T>
-impl<S> FromRequest<S> for ValidateJson<ValidateUser>
-where
-    S: Send + Sync,
-{
-    type Rejection = ValidationError;
-     
-    fn from_request(
-        req: Request,
-        state: &S,
-     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        async move {
-            let Json(user): Json<ValidateUser> = Json::from_request(req, state)
-            .await
-            .map_err(|e| ValidationError::InvalaidJson(e.to_string()))?;
-
-
-            if !user.email.contains('@') {
-                return Err(ValidationError::InvalidEmail);
-            }
-
-            if user.name.len() < 3 {
-                return Err(ValidationError::NameTooShort);
-            }
-
-            Ok(ValidateJson(user))   
-        }
-     }
-}
 
 async fn create_validated_user(ValidateJson(user): ValidateJson<ValidateUser>) -> String {
     format!("Validated user created: Name: {}, Email: {}", user.name, user.email)
@@ -138,14 +81,7 @@ struct CreateUserResponse {
     email: String,
 }
 
-async fn create_user(ValidateJson(payload): ValidateJson<ValidateUser>) -> Json<CreateUserResponse> {
-    let response = CreateUserResponse {
-        id: 1,
-        name: payload.name,
-        email: payload.email,
-    };
-    Json(response)
-}
+
 
 #[derive(Clone)]
 struct AppState {
@@ -297,6 +233,70 @@ struct User {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateUser {
+    name: Option<String>,
+    email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+// A wrapper type to validate JSON payloads
+struct ValidateJson<T>(T);
+
+#[derive(Debug, Deserialize)]
+struct ValidateUser {
+    name: String,
+    email: String,
+}
+
+#[derive(Debug)]
+enum ValidationError {
+    InvalaidJson(String),
+    InvalidEmail,
+    NameTooShort
+}
+
+impl IntoResponse for ValidationError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            ValidationError::InvalaidJson(e) => (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)),
+            ValidationError::InvalidEmail => (StatusCode::BAD_REQUEST, "Invalid email format".to_string()),
+            ValidationError::NameTooShort => (StatusCode::BAD_REQUEST, "Name must be at least 3 characters long".to_string()),
+        };
+        (status, message).into_response()
+    }
+}
+
+// Use axum FromRequest to implement validation logic for the defined wrapper type ValidateJson<T>
+impl<S> FromRequest<S> for ValidateJson<ValidateUser>
+where
+    S: Send + Sync,
+{
+    type Rejection = ValidationError;
+     
+    fn from_request(
+        req: Request,
+        state: &S,
+     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        async move {
+            let Json(user): Json<ValidateUser> = Json::from_request(req, state)
+            .await
+            .map_err(|e| ValidationError::InvalaidJson(e.to_string()))?;
+
+
+            if !user.email.contains('@') {
+                return Err(ValidationError::InvalidEmail);
+            }
+
+            if user.name.len() < 3 {
+                return Err(ValidationError::NameTooShort);
+            }
+
+            Ok(ValidateJson(user))   
+        }
+     }
+}
+
 async fn private_route() -> Result<&'static str, AppError> {
     let unaithorized = true; // Simulate an unauthorized access
     if unaithorized {
@@ -328,12 +328,59 @@ impl IntoResponse for DbError {
 }
 
 async fn get_users(State(pool): State<PgPool>) -> Result<Json<Vec<User>>, DbError> {
-    let results = sqlx::query_as::<_, User>("SELECT * FROM users ORDRER BY id CREATEWD_AT DESC")
+    let results = sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at DESC")
         .fetch_all(&pool)
         .await?;
 
     Ok(Json(results))
 }
+
+async fn create_user(State(pool): State<PgPool>, ValidateJson(payload): ValidateJson<ValidateUser>) -> Json<User> {
+     let user  = sqlx::query_as::<_, User>("INSERT INTO users (id, name, email, created_at) VALUES ($1, $2, $3, NOW()) RETURNING *")
+        .bind(Uuid::new_v4()) // Generate a new UUID for the user
+        .bind(&payload.name)
+        .bind(&payload.email)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to create user");
+    Json(user)
+}
+
+async fn get_user_by_id(State(pool): State<PgPool>, Path(id): Path<Uuid>) -> Result<Json<User>, DbError> {
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => DbError::NotFound,
+            other => DbError::Sqlx(other),
+        })?;
+
+    Ok(Json(user))
+}
+
+async fn udpate_user(State(pool): State<PgPool>, Path(id): Path<Uuid>, Json(payload): Json<UpdateUser>) -> Result<Json<User>, DbError> {
+    let mut qb = QueryBuilder::<Postgres>::new("UPDATE users SET ");
+
+    if let Some(name) = &payload.name {
+        qb.push("name = ").push_bind(name).push(", ");
+    }
+    if let Some(email) = &payload.email {
+        qb.push("email = ").push_bind(email).push(", ");
+    }
+    qb.push("created_at = NOW() WHERE id = ").push_bind(id).push(" RETURNING *");
+
+    let query = qb.build_query_as::<User>();
+    let result  = query
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => DbError::NotFound,
+            other => DbError::Sqlx(other),
+        });
+
+        Ok(Json(result?))   
+}    
 
 #[tokio::main]
 async fn main() {
@@ -349,28 +396,32 @@ async fn main() {
         .await
         .expect("Failed to create database pool");
 
+    let user_routes = Router::new()
+        .route("/", post(create_user).get(get_users))
+        .route("/{id}", get(get_user_by_id).put(udpate_user));
+
     // Run Migrations
-    sqlx::query("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+    sqlx::query("CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ DEFAULT NOW())")
         .execute(&pool)
         .await
         .expect("Failed to run migrations");
 
 
-    let state = Arc::new(AppState {
-        db_pool: "Database Connection Pool".to_string(),
-        api_version: "v1".to_string(),
-    });
+    // let state = Arc::new(AppState {
+    //     db_pool: "Database Connection Pool".to_string(),
+    //     api_version: "v1".to_string(),
+    // });
 
-    let config = Arc::new(Config {
-        app_name: "My Axum App".to_string(),
-        app_version: "1.0.0".to_string(),
-    });
+    // let config = Arc::new(Config {
+    //     app_name: "My Axum App".to_string(),
+    //     app_version: "1.0.0".to_string(),
+    // });
 
     // initialize the in-memory todo store
-    let todo_store: TodoStore = Arc::new(RwLock::new(HashMap::new()));
+    // let todo_store: TodoStore = Arc::new(RwLock::new(HashMap::new()));
 
     // dummy db connection pool
-    let db_pool = Arc::new(DbPool::new("postgres://user:password@localhost/db"));
+    // let db_pool = Arc::new(DbPool::new("postgres://user:password@localhost/db"));
 
     let app = Router::new()
         .route("/", get(hello_world))
@@ -379,7 +430,7 @@ async fn main() {
         // .nest("/api/v1", api_v1())
         .route("/multiple_headers/{id}", post(multiple_headers))
         .route("/validated_user", post(create_validated_user))
-        .route("/users", post(create_user))
+        .merge(Router::new().nest("/users", user_routes))
         // .route("/state", get(with_state))
         .fallback(not_found)
         // .with_state(state)
