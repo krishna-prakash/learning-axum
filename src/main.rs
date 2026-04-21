@@ -1,10 +1,12 @@
 
-use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
+use std::{collections::HashMap, sync::{Arc, RwLock}, time::{Duration, Instant}};
 
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
+use ::chrono::Utc;
+use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Postgres, QueryBuilder, pool, postgres::PgPoolOptions, query, types::chrono};
+use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions, types::chrono};
 use thiserror::Error;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -330,30 +332,30 @@ impl IntoResponse for DbError {
     }
 }
 
-async fn get_users(State(pool): State<PgPool>) -> Result<Json<Vec<User>>, DbError> {
+async fn get_users(State(state): State<CombinedState>) -> Result<Json<Vec<User>>, DbError> {
     let results = sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at DESC")
-        .fetch_all(&pool)
+        .fetch_all(&state.pool)
         .await?;
 
     Ok(Json(results))
 }
 
-async fn create_user(State(pool): State<PgPool>, ValidateJson(payload): ValidateJson<ValidateUser>) -> Json<User> {
+async fn create_user(State(state): State<CombinedState>, ValidateJson(payload): ValidateJson<ValidateUser>) -> Json<User> {
      let user  = sqlx::query_as::<_, User>("INSERT INTO users (id, name, email, password_hash, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING *")
         .bind(Uuid::new_v4()) // Generate a new UUID for the user
         .bind(&payload.name)
         .bind(&payload.email)
         .bind(hash_password(&payload.password)) // Hash the password before storing
-        .fetch_one(&pool)
+        .fetch_one(&state.pool)
         .await
         .expect("Failed to create user");
     Json(user)
 }
 
-async fn get_user_by_id(State(pool): State<PgPool>, Path(id): Path<Uuid>) -> Result<Json<User>, DbError> {
+async fn get_user_by_id(State(state): State<CombinedState>, Path(id): Path<Uuid>) -> Result<Json<User>, DbError> {
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
         .bind(id)
-        .fetch_one(&pool)
+        .fetch_one(&state.pool)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => DbError::NotFound,
@@ -363,7 +365,7 @@ async fn get_user_by_id(State(pool): State<PgPool>, Path(id): Path<Uuid>) -> Res
     Ok(Json(user))
 }
 
-async fn udpate_user(State(pool): State<PgPool>, Path(id): Path<Uuid>, Json(payload): Json<UpdateUser>) -> Result<Json<User>, DbError> {
+async fn udpate_user(State(state): State<CombinedState>, Path(id): Path<Uuid>, Json(payload): Json<UpdateUser>) -> Result<Json<User>, DbError> {
     let mut qb = QueryBuilder::<Postgres>::new("UPDATE users SET ");
 
     if let Some(name) = &payload.name {
@@ -376,7 +378,7 @@ async fn udpate_user(State(pool): State<PgPool>, Path(id): Path<Uuid>, Json(payl
 
     let query = qb.build_query_as::<User>();
     let result  = query
-        .fetch_one(&pool)
+        .fetch_one(&state.pool)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => DbError::NotFound,
@@ -386,10 +388,10 @@ async fn udpate_user(State(pool): State<PgPool>, Path(id): Path<Uuid>, Json(payl
         Ok(Json(result?))   
 }    
 
-async fn delete_user(State(pool): State<PgPool>, Path(id): Path<Uuid>) -> Result<StatusCode, DbError> {
+async fn delete_user(State(state): State<CombinedState>, Path(id): Path<Uuid>) -> Result<StatusCode, DbError> {
     let result = sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(id)
-        .execute(&pool)
+        .execute(&state.pool)
         .await
         .map_err(|e| DbError::Sqlx(e))?;
 
@@ -402,6 +404,25 @@ async fn delete_user(State(pool): State<PgPool>, Path(id): Path<Uuid>) -> Result
 
 // Auth 
 // Password hashing example using argon2
+
+#[derive(Clone, Debug)]
+struct CombinedState {
+    config: Arc<AuthConfig>,
+    pool: PgPool,
+}
+
+#[derive(Clone, Debug)]
+struct AuthConfig {
+    jwt_secret: String,
+    jwt_expiry_in_hours: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+    role: String,
+}
 
 fn hash_password(password: &str) -> String {
     let salt = SaltString::generate(&mut rand::rngs::OsRng);
@@ -418,16 +439,22 @@ fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct LoginRequest {
     email: String,
     password: String,
 }
 
-async fn login(State(pool): State<PgPool>, Json(payload): Json<LoginRequest>) -> Result<String, AppError> {
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    token: String,
+    expiry: i64,
+}
+
+async fn login(State(state): State<CombinedState>, Json(payload): Json<LoginRequest>) -> Result<Json<LoginResponse>, AppError> {
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
         .bind(&payload.email)
-        .fetch_one(&pool)
+        .fetch_one(&state.pool)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::Unauthorized,
@@ -435,10 +462,29 @@ async fn login(State(pool): State<PgPool>, Json(payload): Json<LoginRequest>) ->
         })?;
 
         if verify_password(&payload.password, &user.password_hash) {
-            Ok(format!("Welcome back, {}!", user.name))
+            let token = create_jwt(user.id, &state.config).map_err(|_| AppError::InternalError)?;
+            Ok(Json(LoginResponse {
+                token,
+                expiry: state.config.jwt_expiry_in_hours as i64 * 3600,
+            }))
         } else {
             Err(AppError::Unauthorized)
         }
+}
+
+fn create_jwt(user_id: Uuid, config: &AuthConfig) -> Result<String, StatusCode> {
+    let expiry = Utc::now()  + Duration::from_hours(config.jwt_expiry_in_hours);
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp: expiry.timestamp() as usize,
+        role: "user".to_string(),
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+    )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[tokio::main]
@@ -447,13 +493,22 @@ async fn main() {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 
     let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
-    println!("Database URL: {}", db_url);
+
+    let config = Arc::new(AuthConfig {
+        jwt_secret: "supersecretkey".to_string(),
+        jwt_expiry_in_hours: 24,
+    });
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&db_url)
         .await
         .expect("Failed to create database pool");
+
+    let combined_state = CombinedState {
+        pool: pool.clone(),
+        config: config.clone(),
+    };
 
     let user_routes = Router::new()
         .route("/", post(create_user).get(get_users))
@@ -502,8 +557,7 @@ async fn main() {
         // .with_state(db_pool)
         // .route("/users/{id}", get(get_user))
         .route("/private", get(private_route))
-        .route("/get_users", get(get_users))
-        .with_state(pool)
+        .with_state(combined_state)
         .layer(middleware::from_fn(with_tracing))
         .layer(
             ServiceBuilder::new().layer(TraceLayer::new_for_http())

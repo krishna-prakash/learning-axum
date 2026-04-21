@@ -8,6 +8,7 @@ argon2 = "0.5.3"
 axum = "0.8.8"
 chrono = { version = "0.4.44", features = ["serde"] }
 dotenv = "0.15.0"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 rand = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
