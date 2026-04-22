@@ -2,7 +2,7 @@
 use std::{collections::HashMap, sync::{Arc, RwLock}, time::{Duration, Instant}};
 
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::SaltString};
-use axum::{Json, Router, extract::{FromRequest, Path, Query, Request, State}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
+use axum::{Json, Router, extract::{FromRequest, Multipart, Path, Query, Request, State, WebSocketUpgrade, ws::{Message, WebSocket}}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
 use ::chrono::Utc;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -526,8 +526,45 @@ async fn auth_middleware(
     
 }
 
+async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(handle_websocket)
+}
+
+async fn handle_websocket(mut socket: WebSocket) {
+    while let Some(msg) = socket.recv().await {
+       if let Ok(Message::Text(text)) = msg {
+            let response = format!("Received message: {}", text);
+            if socket.send(Message::Text(response.into())).await.is_err() {
+                break;
+            }
+       }
+    }
+}
+
+async fn file_upload_handler(mut multipart: Multipart) -> impl IntoResponse {
+    let mut files = Vec::new();
+
+    while let Some(multipart_field) = multipart.next_field().await.unwrap() {
+        let name = multipart_field.name().unwrap_or("file").to_string();
+        let data = multipart_field.bytes().await.unwrap();
+        files.push(format!("{} :{} bytes", name, data.len()));
+    }
+
+    if files.is_empty() {
+        "No files uploaded".to_string()
+    } else {
+        format!("Uploaded file:{}", files.join(", "))
+    }
+}
+
 #[tokio::main]
 async fn main() {
+
+    std::fs::create_dir_all("static").ok();
+    if !std::path::Path::new("static/hello.txt").exists() {
+        std::fs::write("static/hello.txt", "Hello, World!").ok();
+    }
+    
     dotenv::dotenv().ok();
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 
@@ -580,6 +617,8 @@ async fn main() {
     // dummy db connection pool
     // let db_pool = Arc::new(DbPool::new("postgres://user:password@localhost/db"));
 
+    // create files
+
     let app = Router::new()
         .route("/", get(hello_world))
         .route("/health", get(health_check))
@@ -600,6 +639,9 @@ async fn main() {
         // .with_state(db_pool)
         // .route("/users/{id}", get(get_user))
         .merge(Router::new().nest("/private", private_routes))
+        .route("/ws", get(ws_handler))
+        .route("/upload", post(file_upload_handler))
+        .nest_service("/static", tower_http::services::ServeDir::new("static"))
         .with_state(combined_state)
         .layer(middleware::from_fn(with_tracing))
         .layer(
