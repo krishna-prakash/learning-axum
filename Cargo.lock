@@ -1450,6 +1450,7 @@ dependencies = [
  "jsonwebtoken",
  "rand",
  "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",

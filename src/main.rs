@@ -302,13 +302,11 @@ where
      }
 }
 
-async fn private_route() -> Result<&'static str, AppError> {
-    let unaithorized = true; // Simulate an unauthorized access
-    if unaithorized {
-        Err(AppError::Unauthorized)
-    } else {
-        Ok("Welcome to the private route!") 
-    }
+async fn private_route(axum::Extension(current_user): axum::Extension<CurrentUser>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "message": format!("Hello, {}! You have accessed a private route.", current_user.id),
+        "role": current_user.role,
+    }))
 }
 
 // Databse error handling example
@@ -451,6 +449,12 @@ struct LoginResponse {
     expiry: i64,
 }
 
+#[derive(Debug, Clone)]
+struct CurrentUser {
+    id: String,
+    role: String,
+}
+
 async fn login(State(state): State<CombinedState>, Json(payload): Json<LoginRequest>) -> Result<Json<LoginResponse>, AppError> {
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
         .bind(&payload.email)
@@ -472,6 +476,7 @@ async fn login(State(state): State<CombinedState>, Json(payload): Json<LoginRequ
         }
 }
 
+
 fn create_jwt(user_id: Uuid, config: &AuthConfig) -> Result<String, StatusCode> {
     let expiry = Utc::now()  + Duration::from_hours(config.jwt_expiry_in_hours);
     let claims = Claims {
@@ -485,6 +490,40 @@ fn create_jwt(user_id: Uuid, config: &AuthConfig) -> Result<String, StatusCode> 
         &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
     )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn verify_jwt(token: &str, config: &AuthConfig) -> Result<Claims, StatusCode> {
+    jsonwebtoken::decode::<Claims>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(config.jwt_secret.as_bytes()),
+        &jsonwebtoken::Validation::default(),
+    )
+    .map(|data| data.claims)
+    .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
+// Auth middleware
+async fn auth_middleware(
+    State(config): State<Arc<AuthConfig>>,
+    mut req: Request,
+    next: Next
+) -> Result<Response, StatusCode> {
+    let auth_header = req
+        .headers()
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    let token = auth_header.ok_or(StatusCode::UNAUTHORIZED)?;
+    let claims = verify_jwt(token, &config)?;
+
+    let current_user = CurrentUser {
+        id: claims.sub, 
+        role: claims.role,
+    };
+    req.extensions_mut().insert(current_user);
+    Ok(next.run(req).await)
+    
 }
 
 #[tokio::main]
@@ -513,6 +552,10 @@ async fn main() {
     let user_routes = Router::new()
         .route("/", post(create_user).get(get_users))
         .route("/{id}", get(get_user_by_id).put(udpate_user).delete(delete_user));
+
+    let private_routes = Router::new()
+        .route("/", get(private_route))
+        .layer(middleware::from_fn_with_state(config.clone(), auth_middleware));
 
     // Run Migrations
     sqlx::query("CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())")
@@ -556,7 +599,7 @@ async fn main() {
         // .route("/db_query", get(db_query))
         // .with_state(db_pool)
         // .route("/users/{id}", get(get_user))
-        .route("/private", get(private_route))
+        .merge(Router::new().nest("/private", private_routes))
         .with_state(combined_state)
         .layer(middleware::from_fn(with_tracing))
         .layer(
