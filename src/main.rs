@@ -557,18 +557,7 @@ async fn file_upload_handler(mut multipart: Multipart) -> impl IntoResponse {
     }
 }
 
-#[tokio::main]
-async fn main() {
-
-    std::fs::create_dir_all("static").ok();
-    if !std::path::Path::new("static/hello.txt").exists() {
-        std::fs::write("static/hello.txt", "Hello, World!").ok();
-    }
-    
-    dotenv::dotenv().ok();
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
-
-    let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
+async fn create_app(db_url: String) -> Router {
 
     let config = Arc::new(AuthConfig {
         jwt_secret: "supersecretkey".to_string(),
@@ -586,6 +575,12 @@ async fn main() {
         config: config.clone(),
     };
 
+      // Run Migrations
+    sqlx::query("CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())")
+        .execute(&pool)
+        .await
+        .expect("Failed to run migrations");
+    
     let user_routes = Router::new()
         .route("/", post(create_user).get(get_users))
         .route("/{id}", get(get_user_by_id).put(udpate_user).delete(delete_user));
@@ -594,32 +589,8 @@ async fn main() {
         .route("/", get(private_route))
         .layer(middleware::from_fn_with_state(config.clone(), auth_middleware));
 
-    // Run Migrations
-    sqlx::query("CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())")
-        .execute(&pool)
-        .await
-        .expect("Failed to run migrations");
 
-
-    // let state = Arc::new(AppState {
-    //     db_pool: "Database Connection Pool".to_string(),
-    //     api_version: "v1".to_string(),
-    // });
-
-    // let config = Arc::new(Config {
-    //     app_name: "My Axum App".to_string(),
-    //     app_version: "1.0.0".to_string(),
-    // });
-
-    // initialize the in-memory todo store
-    // let todo_store: TodoStore = Arc::new(RwLock::new(HashMap::new()));
-
-    // dummy db connection pool
-    // let db_pool = Arc::new(DbPool::new("postgres://user:password@localhost/db"));
-
-    // create files
-
-    let app = Router::new()
+    Router::new()
         .route("/", get(hello_world))
         .route("/health", get(health_check))
         .route("/resource/{id}", get(get_resource_by_id))
@@ -646,9 +617,71 @@ async fn main() {
         .layer(middleware::from_fn(with_tracing))
         .layer(
             ServiceBuilder::new().layer(TraceLayer::new_for_http())
-        );
+        )
+
+}
+
+#[tokio::main]
+async fn main() {
+
+    std::fs::create_dir_all("static").ok();
+    if !std::path::Path::new("static/hello.txt").exists() {
+        std::fs::write("static/hello.txt", "Hello, World!").ok();
+    }
+    
+    dotenv::dotenv().ok();
+    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+
+    let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
+    // let state = Arc::new(AppState {
+    //     db_pool: "Database Connection Pool".to_string(),
+    //     api_version: "v1".to_string(),
+    // });
+
+    // let config = Arc::new(Config {
+    //     app_name: "My Axum App".to_string(),
+    //     app_version: "1.0.0".to_string(),
+    // });
+
+    // initialize the in-memory todo store
+    // let todo_store: TodoStore = Arc::new(RwLock::new(HashMap::new()));
+
+    // dummy db connection pool
+    // let db_pool = Arc::new(DbPool::new("postgres://user:password@localhost/db"));
+
+    // create files
+
+    let app = create_app(db_url).await;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");
     
     axum::serve(listener, app).await.unwrap();
+}
+
+
+#[cfg(test)]
+mod tests {
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_health_check_returns_ok() {
+        dotenv::dotenv().ok(); 
+        
+        let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
+        let app = create_app(db_url).await;
+        
+        let response = app.oneshot(
+            axum::http::Request::builder()
+            .method("GET")
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();  
+
+        assert_eq!(response.status(), StatusCode::OK);   
+    }
 }
