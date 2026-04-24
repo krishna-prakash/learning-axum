@@ -228,7 +228,7 @@ impl IntoResponse for AppError {
     }
 }
 
-#[derive(Serialize, sqlx::FromRow, sqlx::Decode, Debug)]
+#[derive(Serialize, Deserialize, sqlx::FromRow, sqlx::Decode, Debug)]
 struct User {
     id: Uuid,
     name: String,
@@ -557,18 +557,7 @@ async fn file_upload_handler(mut multipart: Multipart) -> impl IntoResponse {
     }
 }
 
-async fn create_app(db_url: String) -> Router {
-
-    let config = Arc::new(AuthConfig {
-        jwt_secret: "supersecretkey".to_string(),
-        jwt_expiry_in_hours: 24,
-    });
-
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await
-        .expect("Failed to create database pool");
+async fn create_app(pool: PgPool, config: Arc<AuthConfig>) -> Router {
 
     let combined_state = CombinedState {
         pool: pool.clone(),
@@ -582,7 +571,7 @@ async fn create_app(db_url: String) -> Router {
         .expect("Failed to run migrations");
     
     let user_routes = Router::new()
-        .route("/", post(create_user).get(get_users))
+        .route("/", get(get_users))
         .route("/{id}", get(get_user_by_id).put(udpate_user).delete(delete_user));
 
     let private_routes = Router::new()
@@ -598,6 +587,7 @@ async fn create_app(db_url: String) -> Router {
         .route("/multiple_headers/{id}", post(multiple_headers))
         .route("/validated_user", post(create_validated_user))
         .route("/login", post(login))
+        .route("/register", post(create_user))
         .merge(Router::new().nest("/users", user_routes))
         // .route("/state", get(with_state))
         .fallback(not_found)
@@ -633,6 +623,19 @@ async fn main() {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 
     let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
+
+let config = Arc::new(AuthConfig {
+        jwt_secret: "supersecretkey".to_string(),
+        jwt_expiry_in_hours: 24,
+    });
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("Failed to create database pool");
+
+    
     // let state = Arc::new(AppState {
     //     db_pool: "Database Connection Pool".to_string(),
     //     api_version: "v1".to_string(),
@@ -651,7 +654,7 @@ async fn main() {
 
     // create files
 
-    let app = create_app(db_url).await;
+    let app = create_app(pool, config).await;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");
     
@@ -670,7 +673,14 @@ mod tests {
         dotenv::dotenv().ok(); 
         
         let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
-        let app = create_app(db_url).await;
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        let config = Arc::new(AuthConfig {
+        jwt_secret: "supersecretkey".to_string(),
+        jwt_expiry_in_hours: 24,
+    });
+
+
+        let app = create_app(pool, config).await;
         
         let response = app.oneshot(
             axum::http::Request::builder()
@@ -683,5 +693,49 @@ mod tests {
         .unwrap();  
 
         assert_eq!(response.status(), StatusCode::OK);   
+    }
+
+    #[tokio::test]
+    async fn test_create_user() {
+        dotenv::dotenv().ok(); 
+        
+        let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        let config = Arc::new(AuthConfig {
+            jwt_secret: "supersecretkey".to_string(),
+            jwt_expiry_in_hours: 24,
+        });
+        let app = create_app(pool.clone(), config).await;
+
+        let payload = serde_json::json!({
+            "name": "Test User",
+            "email": "test@example.com",
+            "password": "password123"
+        });
+
+        let response = app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/register")
+                .header("Content-Type", "application/json")
+                .body(serde_json::to_string(&payload).unwrap())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+
+        let user: User = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user.name, "Test User");
+        assert_eq!(user.email, "test@example.com");
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
