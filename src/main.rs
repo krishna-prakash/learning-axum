@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, sync::{Arc, RwLock}, time::{Duration, Instant}};
+use std::{collections::HashMap, sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
 
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{Json, Router, extract::{FromRequest, Multipart, Path, Query, Request, State, WebSocketUpgrade, ws::{Message, WebSocket}}, http::{HeaderMap, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}};
@@ -85,16 +85,6 @@ struct CreateUserResponse {
 }
 
 
-
-#[derive(Clone)]
-struct AppState {
-    db_pool: String, // Placeholder for a database connection pool
-    api_version: String,
-}
-
-async fn with_state(State(state): State<Arc<AppState>>) -> String {
-    format!("API Version: {}, DB Pool: {}", state.api_version, state.db_pool)
-}
 
 #[derive(Clone, Serialize)]
 struct Config {
@@ -407,6 +397,7 @@ async fn delete_user(State(state): State<CombinedState>, Path(id): Path<Uuid>) -
 struct CombinedState {
     config: Arc<AuthConfig>,
     pool: PgPool,
+    state: AppState,
 }
 
 #[derive(Clone, Debug)]
@@ -557,11 +548,44 @@ async fn file_upload_handler(mut multipart: Multipart) -> impl IntoResponse {
     }
 }
 
-async fn create_app(pool: PgPool, config: Arc<AuthConfig>) -> Router {
+#[derive(Clone, Debug)]
+struct AppState {
+    ready: Arc<AtomicBool>,
+    request_count: Arc<AtomicU64>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            ready: Arc::new(AtomicBool::new(false)),
+            request_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+async fn increase_request_count(
+    State(state): State<AppState>, 
+    req: Request,
+    next: Next
+) -> Response {
+    state.request_count.fetch_add(1, Ordering::SeqCst);
+    next.run(req).await
+}
+
+
+async fn get_metrics(State(combined_state): State<CombinedState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "requests": combined_state.state.request_count.load(Ordering::SeqCst),
+        "ready": combined_state.state.ready.load(Ordering::SeqCst)
+    }))
+}
+
+async fn create_app(pool: PgPool, config: Arc<AuthConfig>, state: AppState) -> Router {
 
     let combined_state = CombinedState {
         pool: pool.clone(),
         config: config.clone(),
+        state: state.clone(),
     };
 
       // Run Migrations
@@ -582,6 +606,7 @@ async fn create_app(pool: PgPool, config: Arc<AuthConfig>) -> Router {
     Router::new()
         .route("/", get(hello_world))
         .route("/health", get(health_check))
+        .route("/metrics", get(get_metrics))
         .route("/resource/{id}", get(get_resource_by_id))
         // .nest("/api/v1", api_v1())
         .route("/multiple_headers/{id}", post(multiple_headers))
@@ -605,6 +630,7 @@ async fn create_app(pool: PgPool, config: Arc<AuthConfig>) -> Router {
         .nest_service("/static", tower_http::services::ServeDir::new("static"))
         .with_state(combined_state)
         .layer(middleware::from_fn(with_tracing))
+        .layer(middleware::from_fn_with_state(state.clone(), increase_request_count))
         .layer(
             ServiceBuilder::new().layer(TraceLayer::new_for_http())
         )
@@ -622,9 +648,10 @@ async fn main() {
     dotenv::dotenv().ok();
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 
+    let app_state = AppState::default();
     let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
 
-let config = Arc::new(AuthConfig {
+    let config = Arc::new(AuthConfig {
         jwt_secret: "supersecretkey".to_string(),
         jwt_expiry_in_hours: 24,
     });
@@ -654,7 +681,7 @@ let config = Arc::new(AuthConfig {
 
     // create files
 
-    let app = create_app(pool, config).await;
+    let app = create_app(pool, config, app_state).await;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");
     
@@ -675,12 +702,12 @@ mod tests {
         let db_url = std::env::var("DATABASE_URL").expect("not able to get the url"); 
         let pool = PgPool::connect(&db_url).await.unwrap();
         let config = Arc::new(AuthConfig {
-        jwt_secret: "supersecretkey".to_string(),
-        jwt_expiry_in_hours: 24,
-    });
+            jwt_secret: "supersecretkey".to_string(),
+            jwt_expiry_in_hours: 24,
+        });
+        let app_state = AppState::default();    
 
-
-        let app = create_app(pool, config).await;
+        let app = create_app(pool, config, app_state).await;
         
         let response = app.oneshot(
             axum::http::Request::builder()
@@ -705,7 +732,8 @@ mod tests {
             jwt_secret: "supersecretkey".to_string(),
             jwt_expiry_in_hours: 24,
         });
-        let app = create_app(pool.clone(), config).await;
+        let app_state = AppState::default();
+        let app = create_app(pool.clone(), config, app_state).await;
 
         let payload = serde_json::json!({
             "name": "Test User",
