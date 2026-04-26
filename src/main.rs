@@ -681,11 +681,43 @@ async fn main() {
 
     // create files
 
-    let app = create_app(pool, config, app_state).await;
+    let app = create_app(pool, config, app_state.clone()).await;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("Failed to bind to address");
     
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+    .with_graceful_shutdown(shutdown_signal(app_state.clone()))
+    .await.unwrap();
+}
+
+async fn shutdown_signal(state: AppState) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install ctrl_c")
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed  at signal handler")
+            .recv()
+            .await
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("Shutdown signal recieved, Gracefully shutting down");
+
+    state.ready.store(false, Ordering::SeqCst);
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+
+
 }
 
 
